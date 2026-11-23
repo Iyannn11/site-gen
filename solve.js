@@ -29,16 +29,18 @@ function isWS(code) {
   );
 }
 
+const ESC_RE = /[&<>"']/g;
+
 /** Escape the range [a, b) of s into out (plain runs copied raw). */
 function escRange(s, out, a, b) {
+  ESC_RE.lastIndex = a;
   let run = a;
-  for (let i = a; i < b; i++) {
-    const e = ESCAPES[s[i]];
-    if (e !== undefined) {
-      if (i > run) out.push(s.slice(run, i));
-      out.push(e);
-      run = i + 1;
-    }
+  let m;
+  while ((m = ESC_RE.exec(s)) !== null && m.index < b) {
+    const i = m.index;
+    if (i > run) out.push(s.slice(run, i));
+    out.push(ESCAPES[s[i]]);
+    run = i + 1;
   }
   if (b > run) out.push(s.slice(run, b));
 }
@@ -56,25 +58,35 @@ export const SLUG_MAX = 64;
 const slugCache = new Map();
 
 /** The slug of `text` (README "Text"), cached per distinct string. */
+// Pure-ASCII strings need no NFKD (it is the identity on ASCII) and no
+// combining-mark strip: the slug is one native regex pass instead of a
+// per-character loop. Non-ASCII strings take the exact loop below.
+const NONASCII = /[^\x00-\x7F]/;
+
 export function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
-  let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
+  let out;
+  if (!NONASCII.test(text)) {
+    out = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-/, '').slice(0, SLUG_MAX).replace(/-+$/, '');
+  } else {
+    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+    let o = '';
+    let gap = false;
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) {
+        gap = o.length > 0;
+        continue;
+      }
+      if (gap) o += '-';
+      gap = false;
+      o += keep;
     }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
+    out = o.slice(0, SLUG_MAX).replace(/-+$/, '');
   }
-  out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   if (out === '') out = 'untitled';
   slugCache.set(text, out);
   return out;
@@ -263,30 +275,35 @@ const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-
 const IS_SPECIAL = new Uint8Array(128);
 for (const ch of ['\\', '`', '*', '[', '&', '<', '>', '"', "'"]) IS_SPECIAL[ch.charCodeAt(0)] = 1;
 
-/** The first index from `from` where s holds `what` outside a backslash escape, or -1. */
+/** The first index from `from` where s holds `what` outside a backslash escape, or -1.
+ * indexOf finds the candidates in C; a candidate is escaped exactly when the
+ * run of backslashes right before it is odd (backslashes pair up left to
+ * right, and `what` always starts on an escapable character). */
 function findUnescaped(s, what, from, end) {
-  const last = Math.min(end, s.length) - what.length;
-  for (let j = from; j <= last; j++) {
-    if (s[j] === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + what.length <= end) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) b++;
+    if (b % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
+/** The first single * from `from` (one whose run is not **), outside an escape, or -1.
+ * Same indexOf + backslash-parity scan as findUnescaped; a star whose next
+ * character is also a star belongs to a ** run and is skipped. */
 function findSingleStar(s, from, end) {
-  for (let j = from; j < end; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < end) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) b++;
+    if (b % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (j + 1 < end && s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -294,68 +311,68 @@ function findSingleStar(s, from, end) {
   return -1;
 }
 
+// Inline specials, scanned by one native regex instead of a per-character loop:
+// plain runs are skipped in C, and only a special stops the scan. The regex is
+// shared; every path sets lastIndex before the next exec, so the recursive
+// calls for bold/italic/link text cannot disturb the outer scan.
+const INLINE_RE = /[\\\\`*[&<>"']/g;
+
 /** Render s[start..end) inline into out; env.link(target) is a link's href. */
 function inlineInto(s, env, out, start, end) {
-  let i = start;
   let run = start;
-  const flush = (to) => {
-    if (to > run) out.push(s.slice(run, to));
-    run = to;
-  };
-  while (i < end) {
-    const code = s.charCodeAt(i);
-    if (code >= 128 || !IS_SPECIAL[code]) {
-      i++;
-      continue;
-    }
+  const re = INLINE_RE;
+  re.lastIndex = start;
+  let m;
+  while ((m = re.exec(s)) !== null && m.index < end) {
+    const i = m.index;
     const c = s[i];
     if (c === '\\' && i + 1 < end && ESCAPABLE.has(s[i + 1])) {
-      flush(i);
+      if (i > run) out.push(s.slice(run, i));
       out.push(s[i + 1]);
-      i += 2;
-      run = i;
+      run = i + 2;
+      re.lastIndex = run;
       continue;
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < end && j > i + 1) {
-        flush(i);
+        if (i > run) out.push(s.slice(run, i));
         out.push('<code>');
         escRange(s, out, i + 1, j);
         out.push('</code>');
-        i = j + 1;
-        run = i;
-      } else i++;
+        run = j + 1;
+        re.lastIndex = run;
+      } else re.lastIndex = i + 1;
       continue;
     }
     if (c === '*') {
       if (i + 1 < end && s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2, end);
         if (j > i + 2) {
-          flush(i);
+          if (i > run) out.push(s.slice(run, i));
           out.push('<strong>');
           inlineInto(s, env, out, i + 2, j);
           out.push('</strong>');
-          i = j + 2;
-          run = i;
-        } else i += 2;
+          run = j + 2;
+          re.lastIndex = run;
+        } else re.lastIndex = i + 2;
         continue;
       }
       const j = findSingleStar(s, i + 1, end);
       if (j > i + 1) {
-        flush(i);
+        if (i > run) out.push(s.slice(run, i));
         out.push('<em>');
         inlineInto(s, env, out, i + 1, j);
         out.push('</em>');
-        i = j + 1;
-        run = i;
-      } else i++;
+        run = j + 1;
+        re.lastIndex = run;
+      } else re.lastIndex = i + 1;
       continue;
     }
     if (c === '[') {
       const k = findUnescaped(s, ']', i + 1, end);
-      const m = k !== -1 && k + 1 < end && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 || m >= end ? '' : s.slice(k + 2, m);
+      const m2 = k !== -1 && k + 1 < end && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = m2 === -1 || m2 >= end ? '' : s.slice(k + 2, m2);
       let hasWS = false;
       for (let t = 0; t < target.length; t++) {
         if (isWS(target.charCodeAt(t))) {
@@ -365,24 +382,24 @@ function inlineInto(s, env, out, start, end) {
       }
       if (target !== '' && !hasWS) {
         const href = env.link(target);
-        flush(i);
+        if (i > run) out.push(s.slice(run, i));
         out.push('<a href="');
         escRange(href, out, 0, href.length);
         out.push('">');
         inlineInto(s, env, out, i + 1, k);
         out.push('</a>');
-        i = m + 1;
-        run = i;
-      } else i++;
+        run = m2 + 1;
+        re.lastIndex = run;
+      } else re.lastIndex = i + 1;
       continue;
     }
     // One of & < > " ' : flush the plain run and write the entity.
-    flush(i);
+    if (i > run) out.push(s.slice(run, i));
     out.push(ESCAPES[c]);
-    i++;
-    run = i;
+    run = i + 1;
+    re.lastIndex = run;
   }
-  flush(end);
+  if (end > run) out.push(s.slice(run, end));
 }
 
 /** `s` rendered inline into out; env.link(target) is a link's href. */
@@ -448,9 +465,10 @@ function isHr(line) {
   return true;
 }
 
-/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
-function endsParagraph(line) {
-  return line === '' || isBlankLine(line) || isFenceOpen(line) !== null || headingOf(line) !== null || isHr(line);
+/** Whether the line at `idx` ends a paragraph: a blank line, a fence, a heading
+ * or a thematic break — read from the cached kind, not re-tested. */
+function endsParagraphIdx(kindOf, idx) {
+  return kindOf(idx) <= 4;
 }
 
 function isBullet(line) {
@@ -483,6 +501,29 @@ function isContinued(line) {
  */
 export function renderMarkdown(src, env) {
   const lines = src.split('\n');
+  // Each line's block kind, computed once and cached: the paragraph branch
+  // used to re-run the fence/heading/hr tests on every following line
+  // (endsParagraph), doubling the classification work. 1 blank, 2 fence,
+  // 3 heading, 4 hr, 5 anything else. The decisions are exactly the main
+  // loop's: a line starting with a space or tab can be neither a fence, a
+  // heading nor a thematic break.
+  const kinds = new Uint8Array(lines.length);
+  const kindOf = (idx) => {
+    let k = kinds[idx];
+    if (k !== 0) return k;
+    const line = lines[idx];
+    if (line === '') k = 1;
+    else {
+      const c0 = line.charCodeAt(0);
+      if (c0 === 32 || c0 === 9) k = isBlankLine(line) ? 1 : 5;
+      else if (isFenceOpen(line) !== null) k = 2;
+      else if (headingOf(line) !== null) k = 3;
+      else if (isHr(line)) k = 4;
+      else k = 5;
+    }
+    kinds[idx] = k;
+    return k;
+  };
   const ids = new Set();
   const out = [];
   const toc = [];
@@ -491,11 +532,12 @@ export function renderMarkdown(src, env) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (line === '' || isBlankLine(line)) {
+    const kind = kindOf(i);
+    if (kind === 1) {
       i++;
       continue;
     }
-    const lang = isFenceOpen(line);
+    const lang = kind === 2 ? isFenceOpen(line) : null;
     if (lang !== null) {
       const body = [];
       i++;
@@ -510,7 +552,7 @@ export function renderMarkdown(src, env) {
       out.push('</code></pre>\n');
       continue;
     }
-    const heading = headingOf(line);
+    const heading = kind === 3 ? headingOf(line) : null;
     if (heading !== null) {
       const id = uniqueSlug(slugify(heading.text), ids);
       out.push(`<h${heading.depth} id="${id}">`);
@@ -521,7 +563,7 @@ export function renderMarkdown(src, env) {
       i++;
       continue;
     }
-    if (isHr(line)) {
+    if (kind === 4) {
       out.push('<hr>\n');
       i++;
       continue;
@@ -584,7 +626,7 @@ export function renderMarkdown(src, env) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < n && !endsParagraphIdx(kindOf, i)) body.push(trimLine(lines[i++]));
     const text = body.join('\n');
     out.push('<p>');
     const mark = out.length;
@@ -718,9 +760,11 @@ function textOf(v, out) {
 }
 
 /** A value as text, HTML-escaped, straight into out (no intermediate string). */
+const ESC_TEST = /[&<>"']/;
+
 function textOfEscaped(v, out) {
   if (typeof v === 'string') {
-    if (v.indexOf('&') === -1 && v.indexOf('<') === -1 && v.indexOf('>') === -1 && v.indexOf('"') === -1 && v.indexOf("'") === -1) out.push(v);
+    if (!ESC_TEST.test(v)) out.push(v);
     else escRange(v, out, 0, v.length);
   } else if (typeof v === 'number') out.push(String(v));
   else if (typeof v === 'boolean') out.push(v ? 'true' : 'false');
